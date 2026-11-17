@@ -17,16 +17,15 @@ package chain
 
 import (
 	"errors"
+	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
-
-// Packages you will probably need (delete this line once you use it).
-var _ = errors.Is
 
 // SyncInterval is how often the pull loop runs. Tests rely on nodes converging within a
 // few intervals after a partition heals, so keep it at most 2 s.
@@ -78,31 +77,141 @@ func (h *Handler) Stop() { h.once.Do(func() { close(h.stop) }) }
 //   - Parent unknown: fetch the missing ancestors from `from` (fetchChain).
 //   - Valid and new (canonical or not): relay it to every peer except `from`.
 //   - Invalid: drop it (log it), do not relay.
-//
-// TODO. errors.Is(err, ErrUnknownParent) tells the parent-unknown case apart.
 func (h *Handler) HandleBlock(b *types.Block, from string) {
-	todo(h.log, "Handler.HandleBlock")
+	if b == nil {
+		return
+	}
+	if h.bc.HasBlock(b.Hash()) {
+		return
+	}
+	status, err := h.bc.InsertBlock(b)
+	if err != nil {
+		if errors.Is(err, ErrUnknownParent) {
+			if err := h.fetchChain(from, b.Hash()); err != nil {
+				h.log.Printf("block %d %s from %s: fetching ancestors: %v",
+					b.NumberU64(), b.Hash().TerminalString(), from, err)
+			}
+			return
+		}
+		h.log.Printf("rejecting block %d %s from %s: %v", b.NumberU64(), b.Hash().TerminalString(), from, err)
+		return
+	}
+	if status == StatusKnown {
+		return
+	}
+	// Valid and new: relay it to everyone but the sender.
+	h.net.BroadcastBlock(b, from)
 }
 
 // fetchChain downloads the block `tip` and every ancestor of it that we do not have from
 // peer (RequestAncestors, newest first, as many requests as needed), inserts them oldest
 // first, and relays tip if it was inserted.
-//
-// TODO. Ask for MaxAncestors blocks at a time, starting from tip, then from the parent of
-// the oldest block received, until you reach a block whose parent you have. Check what
-// the peer sends: the first block must be the one you asked for, and each next one the
-// parent of the previous. Stop after maxSyncDepth blocks. Then h.bc.InsertChain(oldest
-// first). Remember: genesis is never sent, and you always have it.
 func (h *Handler) fetchChain(peer string, tip common.Hash) error {
-	return ErrNotImplemented
+	if h.bc.HasBlock(tip) {
+		return nil
+	}
+	var collected []*types.Block // newest first
+	var tipBlock *types.Block
+	want := tip
+	for total := 0; ; {
+		blocks, err := h.net.RequestAncestors(peer, want, MaxAncestors)
+		if err != nil {
+			return err
+		}
+		if len(blocks) == 0 {
+			return fmt.Errorf("peer %s returned no blocks for %s", peer, want.TerminalString())
+		}
+		// Do not trust the peer: the first block must be the one we asked for, and each
+		// following block must be the parent of the previous one.
+		if blocks[0].Hash() != want {
+			return fmt.Errorf("peer %s returned %s, asked for %s",
+				peer, blocks[0].Hash().TerminalString(), want.TerminalString())
+		}
+		for i, b := range blocks {
+			if i > 0 {
+				prev := blocks[i-1]
+				if b.Hash() != prev.ParentHash() || b.NumberU64()+1 != prev.NumberU64() {
+					return fmt.Errorf("peer %s sent a non-contiguous chain at block %d %s",
+						peer, b.NumberU64(), b.Hash().TerminalString())
+				}
+			}
+			if h.bc.HasBlock(b.Hash()) {
+				// A race with another insertion, or the peer sent too much: stop here.
+				blocks = blocks[:i]
+				break
+			}
+		}
+		if len(blocks) == 0 {
+			break
+		}
+		if tipBlock == nil {
+			tipBlock = blocks[0]
+		}
+		collected = append(collected, blocks...)
+		total += len(blocks)
+		if total > maxSyncDepth {
+			return fmt.Errorf("peer %s: chain from %s is deeper than %d blocks",
+				peer, tip.TerminalString(), maxSyncDepth)
+		}
+		oldest := blocks[len(blocks)-1]
+		if oldest.NumberU64() == 1 || h.bc.HasBlock(oldest.ParentHash()) {
+			break // it connects to the genesis block or to a block we already have
+		}
+		want = oldest.ParentHash()
+	}
+
+	for i := len(collected) - 1; i >= 0; i-- {
+		if _, err := h.bc.InsertBlock(collected[i]); err != nil {
+			return fmt.Errorf("inserting block %d %s: %w", collected[i].NumberU64(), collected[i].Hash().TerminalString(), err)
+		}
+	}
+	if tipBlock != nil {
+		h.net.BroadcastBlock(tipBlock, peer)
+	}
+	return nil
 }
 
 // SyncOnce asks every peer for its head and, if the best one has a higher total
 // difficulty than ours, fetches its chain. Peers that do not answer are skipped.
-//
-// TODO. Ask all peers (in parallel is better: a slow peer should not delay the others).
-// Pick the heaviest head we do not have; if fetching from that peer fails, try the next
-// best one. A peer's claimed TD is only a hint: InsertBlock computes the real one.
 func (h *Handler) SyncOnce() {
-	todo(h.log, "Handler.SyncOnce")
+	peers := h.net.Peers()
+	if len(peers) == 0 {
+		return
+	}
+	type answer struct {
+		peer string
+		head PeerHead
+		err  error
+	}
+	results := make(chan answer, len(peers))
+	for _, peer := range peers {
+		go func(peer string) {
+			head, err := h.net.RequestHead(peer)
+			results <- answer{peer, head, err}
+		}(peer)
+	}
+
+	heads := make([]answer, 0, len(peers))
+	for range peers {
+		if a := <-results; a.err == nil && a.head.TD != nil {
+			heads = append(heads, a)
+		}
+	}
+	// Heaviest first. A peer's claimed TD is only a hint: InsertBlock computes the real one.
+	sort.Slice(heads, func(i, j int) bool { return heads[i].head.TD.Cmp(heads[j].head.TD) > 0 })
+
+	local := h.bc.GetTd(h.bc.CurrentBlock().Hash())
+	for _, a := range heads {
+		if local != nil && a.head.TD.Cmp(local) <= 0 {
+			break // sorted: the rest are no heavier either
+		}
+		if h.bc.HasBlock(a.head.Hash) {
+			continue
+		}
+		if err := h.fetchChain(a.peer, a.head.Hash); err != nil {
+			h.log.Printf("sync from %s (head %d %s): %v", a.peer, a.head.Number, a.head.Hash.TerminalString(), err)
+			continue // try the next heaviest peer
+		}
+		return
+	}
 }

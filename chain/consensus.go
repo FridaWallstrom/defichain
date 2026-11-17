@@ -7,12 +7,11 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
 	"defichain/spec"
 )
-
-var _ = fmt.Errorf // you will need it (delete this line then)
 
 // CalcDifficulty is the difficulty a child of parent with timestamp `time` must have.
 // It is Ethereum's Homestead rule (EIP-2) with our parameters:
@@ -26,12 +25,44 @@ var _ = fmt.Errorf // you will need it (delete this line then)
 // how fast blocks were found, which is why miners must not lie about time too much (see
 // MaxFutureTime). VerifyHeader rejects time <= parent.Time before calling this; treat
 // that case as time - parent.Time = 0.
-//
-// TODO: careful with unsigned arithmetic: time - parent.Time underflows if time is smaller,
-// and converting a huge uint64 quotient to int64 can overflow; clamp before converting.
-// Compute with new big.Ints: never modify parent.Difficulty.
 func CalcDifficulty(cfg spec.ChainConfig, time uint64, parent *types.Header) *big.Int {
-	return nil
+	minimum := new(big.Int).SetUint64(cfg.MinimumDifficulty)
+	if parent == nil || parent.Difficulty == nil {
+		return minimum
+	}
+	// Work on copies: never modify parent.Difficulty.
+	base := new(big.Int).Set(parent.Difficulty)
+
+	var delta uint64
+	if time > parent.Time {
+		delta = time - parent.Time
+	}
+	target := cfg.TargetBlockTime
+	if target == 0 {
+		target = 1 // the config forbids this; do not panic on a broken config
+	}
+	// x = max(1 - delta/target, -99). Clamp the quotient before converting it to a
+	// signed integer: delta can be huge.
+	q := delta / target
+	x := int64(1)
+	if q >= 100 {
+		x = -99
+	} else {
+		x = 1 - int64(q)
+	}
+
+	divisor := cfg.DifficultyBoundDivisor
+	if divisor == 0 {
+		divisor = 1
+	}
+	step := new(big.Int).Div(base, new(big.Int).SetUint64(divisor))
+	step.Mul(step, big.NewInt(x))
+
+	diff := new(big.Int).Add(base, step)
+	if diff.Cmp(minimum) < 0 {
+		diff.Set(minimum)
+	}
+	return diff
 }
 
 // VerifyHeader checks every rule a header must follow, given its parent and the local
@@ -50,12 +81,65 @@ func CalcDifficulty(cfg spec.ChainConfig, time uint64, parent *types.Header) *bi
 //	10. VerifySeal(h) == nil                                   (VerifySeal's error)
 //
 // The cheap checks come first, the seal last: a node should not spend effort on a block
-// that is wrong anyway. (Hashing the seal is cheap here, but it is not with Ethash.)
-//
-// TODO: one `if` per rule, in this order. Wrap the sentinel so errors.Is finds it and
-// the message says what is wrong: fmt.Errorf("%w: %d, want %d", ErrInvalidGasLimit, a, b).
-// Any field may be nil in a malicious header (h.Number, h.Difficulty, h.BaseFee): an
-// error, never a panic.
+// that is wrong anyway.
 func VerifyHeader(cfg spec.ChainConfig, h, parent *types.Header, now uint64) error {
-	return ErrNotImplemented
+	if h == nil {
+		return fmt.Errorf("%w: nil header", ErrInvalidNumber)
+	}
+	if parent == nil {
+		return fmt.Errorf("%w: nil parent header", ErrInvalidNumber)
+	}
+
+	// 1. Height.
+	if h.Number == nil || parent.Number == nil {
+		return fmt.Errorf("%w: nil block number", ErrInvalidNumber)
+	}
+	wantNumber := new(big.Int).Add(parent.Number, common.Big1)
+	if h.Number.Cmp(wantNumber) != 0 {
+		return fmt.Errorf("%w: got %v, want %v", ErrInvalidNumber, h.Number, wantNumber)
+	}
+
+	// 2. Time strictly after the parent.
+	if h.Time <= parent.Time {
+		return fmt.Errorf("%w: %d is not after the parent's %d", ErrInvalidTimestamp, h.Time, parent.Time)
+	}
+
+	// 3. Not too far ahead of the local clock. Compare the gap to avoid overflow.
+	if h.Time > now && h.Time-now > cfg.MaxFutureTime {
+		return fmt.Errorf("%w: %d is more than %d s ahead of %d", ErrFutureBlock, h.Time, cfg.MaxFutureTime, now)
+	}
+
+	// 4. Difficulty.
+	wantDiff := CalcDifficulty(cfg, h.Time, parent)
+	if h.Difficulty == nil || h.Difficulty.Cmp(wantDiff) != 0 {
+		return fmt.Errorf("%w: got %v, want %v", ErrInvalidDifficulty, h.Difficulty, wantDiff)
+	}
+
+	// 5. Gas limit.
+	if h.GasLimit != cfg.GasLimit {
+		return fmt.Errorf("%w: got %d, want %d", ErrInvalidGasLimit, h.GasLimit, cfg.GasLimit)
+	}
+
+	// 6. Gas used.
+	if h.GasUsed > h.GasLimit {
+		return fmt.Errorf("%w: %d > %d", ErrInvalidGasUsed, h.GasUsed, h.GasLimit)
+	}
+
+	// 7. Extra data.
+	if len(h.Extra) > 32 {
+		return fmt.Errorf("%w: %d bytes", ErrExtraTooLong, len(h.Extra))
+	}
+
+	// 8. No uncles.
+	if h.UncleHash != types.EmptyUncleHash {
+		return fmt.Errorf("%w: uncle hash %s, want %s", ErrInvalidUncles, h.UncleHash.Hex(), types.EmptyUncleHash.Hex())
+	}
+
+	// 9. Base fee: present and zero.
+	if h.BaseFee == nil || h.BaseFee.Sign() != 0 {
+		return fmt.Errorf("%w: got %v, want 0", ErrInvalidBaseFee, h.BaseFee)
+	}
+
+	// 10. The seal, last: it is the most expensive check.
+	return VerifySeal(h)
 }

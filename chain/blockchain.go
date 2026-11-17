@@ -13,20 +13,11 @@ package chain
 // Tests: go test ./chain -run TestChain -v
 
 import (
-	"errors"
 	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-)
-
-// Packages you will probably need (delete these lines once you use them).
-var (
-	_ = errors.New
-	_ = fmt.Errorf
-	_ = big.NewInt
-	_ = common.Hash{}
 )
 
 // chainExt is room for your own state in BlockChain (bc.ext). Its zero value must be
@@ -45,11 +36,42 @@ type chainExt struct{}
 //  6. Fork choice: if td > TD(current head), reorg to b -> StatusCanon; else StatusSide.
 //
 // An invalid block must not be stored, and must not change the head.
-//
-// TODO. Do not call InsertBlock or InsertChain from here: bc.insertMu is already held, it
-// would deadlock. Use bc.Now(), not time.Now(): tests set the clock.
 func (bc *BlockChain) insertBlock(b *types.Block) (InsertStatus, error) {
-	return 0, ErrNotImplemented
+	if b == nil {
+		return StatusKnown, fmt.Errorf("%w: nil block", ErrInvalidBlock)
+	}
+	if bc.HasBlock(b.Hash()) {
+		return StatusKnown, nil
+	}
+	parent := bc.GetBlock(b.ParentHash())
+	if parent == nil {
+		return StatusKnown, fmt.Errorf("%w: %s", ErrUnknownParent, b.ParentHash().TerminalString())
+	}
+
+	now := bc.Now().Unix()
+	var nowu uint64
+	if now > 0 {
+		nowu = uint64(now)
+	}
+	if err := VerifyHeader(bc.cfg, b.Header(), parent.Header(), nowu); err != nil {
+		return StatusKnown, err
+	}
+	res, err := bc.processBlock(b)
+	if err != nil {
+		return StatusKnown, err
+	}
+
+	td := new(big.Int).Add(bc.GetTd(parent.Hash()), b.Difficulty())
+	bc.writeBlock(b, td, res)
+
+	head := bc.CurrentBlock()
+	if td.Cmp(bc.GetTd(head.Hash())) > 0 {
+		if err := bc.reorg(head, b); err != nil {
+			return StatusSide, err
+		}
+		return StatusCanon, nil
+	}
+	return StatusSide, nil
 }
 
 // reorg makes newHead the head of the canonical chain, in place of oldHead. Usually
@@ -65,9 +87,66 @@ func (bc *BlockChain) insertBlock(b *types.Block) (InsertStatus, error) {
 //     pass them to setHead, oldest block first, in block order.
 //
 // Finally setHead(newHead, dropped).
-//
-// TODO. Draw the two branches on paper first, for the case where newHead is lower than
-// oldHead (a shorter but heavier chain): which heights must change, which must disappear?
 func (bc *BlockChain) reorg(oldHead, newHead *types.Block) error {
-	return ErrNotImplemented
+	if oldHead == nil || newHead == nil {
+		return fmt.Errorf("reorg: nil head")
+	}
+	old, next := oldHead, newHead
+	var added, removed []*types.Block // newest first while walking
+
+	// Bring both branches to the same height.
+	for old.NumberU64() > next.NumberU64() {
+		removed = append(removed, old)
+		old = bc.GetBlock(old.ParentHash())
+		if old == nil {
+			return fmt.Errorf("reorg: missing ancestor of the old head")
+		}
+	}
+	for next.NumberU64() > old.NumberU64() {
+		added = append(added, next)
+		next = bc.GetBlock(next.ParentHash())
+		if next == nil {
+			return fmt.Errorf("reorg: missing ancestor of the new head")
+		}
+	}
+	// Walk both back until they meet: the common ancestor.
+	for old.Hash() != next.Hash() {
+		removed = append(removed, old)
+		added = append(added, next)
+		old = bc.GetBlock(old.ParentHash())
+		next = bc.GetBlock(next.ParentHash())
+		if old == nil || next == nil {
+			return fmt.Errorf("reorg: the two heads are not in the same tree")
+		}
+	}
+
+	// The new branch, oldest first, becomes canonical.
+	for i := len(added) - 1; i >= 0; i-- {
+		bc.writeCanonical(added[i])
+	}
+	// Heights above the new head must not stay canonical (the new chain may be shorter).
+	if newHead.NumberU64() < oldHead.NumberU64() {
+		for n := newHead.NumberU64() + 1; n <= oldHead.NumberU64(); n++ {
+			bc.deleteCanonical(n)
+		}
+	}
+
+	// Transactions of the old branch that are not in the new one go back to the pool.
+	onNewBranch := make(map[common.Hash]bool)
+	for _, b := range added {
+		for _, tx := range b.Transactions() {
+			onNewBranch[tx.Hash()] = true
+		}
+	}
+	var dropped []*types.Transaction
+	for i := len(removed) - 1; i >= 0; i-- { // oldest block first
+		for _, tx := range removed[i].Transactions() {
+			if !onNewBranch[tx.Hash()] {
+				dropped = append(dropped, tx)
+			}
+		}
+	}
+
+	bc.setHead(newHead, dropped)
+	return nil
 }

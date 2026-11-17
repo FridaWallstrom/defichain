@@ -21,13 +21,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// Packages you will probably need (delete these lines once you use them).
-var (
-	_ = errors.Is
-	_ = fmt.Errorf
-	_ = time.Second
-)
-
 // Broadcaster is the part of the network the miner needs.
 type Broadcaster interface {
 	BroadcastBlock(b *types.Block, except string)
@@ -91,28 +84,53 @@ func (m *Miner) Stop() {
 	}
 }
 
-// loop mines until ctx is cancelled, then closes done. Each attempt must be cancelled when
-// the head changes (so we never keep mining on a stale head) or after `recommit` (to
-// include new transactions).
-//
-// TODO. One way:
-//
-//	defer close(done)
-//	heads, unsubscribe := m.bc.SubscribeHead()     // receives the new head on every change
-//	defer unsubscribe()
-//	for ctx.Err() == nil {
-//	    parent := m.bc.CurrentBlock()
-//	    attempt, cancel := context.WithTimeout(ctx, recommit)
-//	    // a goroutine that calls cancel() when a head different from parent arrives on
-//	    // `heads` (and returns when attempt is done); wait for it to return before the
-//	    // next attempt, or two of them will race for the next head event
-//	    m.mineMu.Lock(); _, err := m.mine(attempt, parent); m.mineMu.Unlock()
-//	    cancel()
-//	    // context.Canceled / DeadlineExceeded are normal; log other errors, wait a second
-//	}
+// loop mines until ctx is cancelled, then closes done. Each attempt is cancelled when the
+// head changes (so we never keep mining on a stale head) or after `recommit` (to include
+// new transactions).
 func (m *Miner) loop(ctx context.Context, done chan struct{}) {
 	defer close(done)
-	todo(m.log, "Miner.loop")
+	heads, unsubscribe := m.bc.SubscribeHead()
+	defer unsubscribe()
+
+	for ctx.Err() == nil {
+		parent := m.bc.CurrentBlock()
+		attempt, cancel := context.WithTimeout(ctx, recommit)
+
+		// Watch for a new head: if it is not the block we are mining on, abandon the
+		// attempt at once. Join this goroutine before the next attempt, or two of them
+		// would race for the next head event.
+		watcherDone := make(chan struct{})
+		go func(parent *types.Block) {
+			defer close(watcherDone)
+			for {
+				select {
+				case <-attempt.Done():
+					return
+				case head := <-heads:
+					// A head event that is not our parent means our work is stale.
+					if head.Hash() != parent.Hash() {
+						cancel()
+						return
+					}
+				}
+			}
+		}(parent)
+
+		m.mineMu.Lock()
+		_, err := m.mine(attempt, parent)
+		m.mineMu.Unlock()
+		cancel()
+		<-watcherDone
+
+		if err != nil && ctx.Err() == nil &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			m.log.Printf("mining: %v", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+		}
+	}
 }
 
 // MineBlock mines exactly one block on the current head, inserts it and broadcasts it.
@@ -128,13 +146,69 @@ func (m *Miner) MineBlock(ctx context.Context) (*types.Block, error) {
 //   - Time: the local clock, but at least parent.Time+1. Never more than MaxFutureTime
 //     ahead of the clock: your own node would reject the block (ErrFutureBlock), so wait.
 //   - Difficulty: CalcDifficulty(cfg, time, parent).
-//   - Coinbase: m.coinbase. Extra: anything up to 32 bytes (e.g. a name), or nothing.
+//   - Coinbase: m.coinbase. Extra: anything up to 32 bytes, or nothing.
 //   - Transactions: m.pool.Pending(); BuildBlock drops the ones that do not fit.
 //
 // Then Seal (with m.throttle), InsertBlock, and BroadcastBlock(sealed, "").
-//
-// TODO. Use m.bc.Now() for the clock (tests set it). While waiting for the clock, return
-// ctx.Err() if ctx is cancelled. Log the mined block (number, hash, status): it helps.
 func (m *Miner) mine(ctx context.Context, parent *types.Block) (*types.Block, error) {
-	return nil, ErrNotImplemented
+	if parent == nil {
+		return nil, fmt.Errorf("mine: no parent block")
+	}
+	cfg := m.bc.Config()
+
+	// Wait until a timestamp that is both after the parent and not too far ahead of the
+	// local clock is possible.
+	var ts uint64
+	for {
+		now := m.bc.Now().Unix()
+		var nowu uint64
+		if now > 0 {
+			nowu = uint64(now)
+		}
+		ts = nowu
+		if ts <= parent.Time() {
+			ts = parent.Time() + 1
+		}
+		limit := nowu + cfg.MaxFutureTime
+		if ts <= limit {
+			break
+		}
+		wait := time.Duration(ts-limit) * time.Second
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+
+	h := &types.Header{
+		Coinbase:   m.coinbase,
+		Time:       ts,
+		Difficulty: CalcDifficulty(cfg, ts, parent.Header()),
+		Extra:      []byte("defichain"),
+	}
+	var txs []*types.Transaction
+	if m.pool != nil {
+		txs = m.pool.Pending()
+	}
+	b, err := m.bc.BuildBlock(parent, h, txs)
+	if err != nil {
+		return nil, fmt.Errorf("build block %d: %w", parent.NumberU64()+1, err)
+	}
+	sealed, err := Seal(ctx, b, m.throttle)
+	if err != nil {
+		return nil, err
+	}
+	status, err := m.bc.InsertBlock(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("insert mined block %d: %w", sealed.NumberU64(), err)
+	}
+	if m.net != nil {
+		m.net.BroadcastBlock(sealed, "")
+	}
+	if m.log != nil {
+		m.log.Printf("mined block %d %s (%s, %d txs, gas %d)", sealed.NumberU64(), sealed.Hash().TerminalString(),
+			status, len(sealed.Transactions()), sealed.GasUsed())
+	}
+	return sealed, nil
 }

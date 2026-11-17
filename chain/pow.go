@@ -29,54 +29,76 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
-// Packages you will probably need (delete these lines once you use them).
-var (
-	_ = binary.BigEndian
-	_ = fmt.Errorf
-	_ = rand.Uint64
-	_ = crypto.Keccak256Hash
-	_ = rlp.EncodeToBytes
-	_ = context.Background
-)
-
 // two256 is 2^256.
 var two256 = new(big.Int).Lsh(common.Big1, 256)
 
 // SealHash is the hash a miner works on: the header without its seal (Nonce, MixDigest).
 // Every other field, including the difficulty and the timestamp, is covered, so changing
 // any of them invalidates the seal.
-//
-// TODO: copy the header (types.CopyHeader: never modify the caller's header), zero its
-// Nonce and MixDigest, RLP-encode it (rlp.EncodeToBytes) and return the Keccak256 hash.
 func SealHash(h *types.Header) common.Hash {
-	return common.Hash{}
+	if h == nil {
+		return common.Hash{}
+	}
+	c := types.CopyHeader(h)
+	c.Nonce = types.BlockNonce{}
+	c.MixDigest = common.Hash{}
+	enc, err := rlp.EncodeToBytes(c)
+	if err != nil {
+		// Headers are always encodable unless a big.Int field is negative. Treat that as
+		// an unusable header rather than panicking; VerifyHeader rejects it earlier.
+		return common.Hash{}
+	}
+	return crypto.Keccak256Hash(enc)
 }
 
 // PowHash is Keccak256(sealHash || nonce), the nonce as 8 big-endian bytes.
-//
-// TODO: 40 bytes, the 32 of sealHash then the nonce (binary.BigEndian.PutUint64).
 func PowHash(sealHash common.Hash, nonce uint64) common.Hash {
-	return common.Hash{}
+	var buf [40]byte
+	copy(buf[:32], sealHash[:])
+	binary.BigEndian.PutUint64(buf[32:], nonce)
+	return crypto.Keccak256Hash(buf[:])
 }
 
 // Target is the largest PoW hash a block of this difficulty may have: 2^256 / difficulty
 // (integer division). Doubling the difficulty halves the target, so it takes twice as many
 // attempts on average to find a nonce.
 //
-// TODO: one line, with two256. Return a new big.Int; do not modify the argument.
+// A missing or non-positive difficulty has no target; nil is returned (the callers reject
+// such headers with ErrInvalidDifficulty first).
 func Target(difficulty *big.Int) *big.Int {
-	return nil
+	if difficulty == nil || difficulty.Sign() <= 0 {
+		return nil
+	}
+	return new(big.Int).Div(two256, difficulty)
 }
 
 // VerifySeal checks h's proof of work: MixDigest must equal PowHash(SealHash(h), nonce),
 // and that hash, read as a big-endian number, must be <= Target(h.Difficulty). Errors
 // wrap ErrInvalidDifficulty (difficulty missing or <= 0), ErrInvalidMixDigest or
 // ErrInvalidPoW.
-//
-// TODO: check the difficulty first (nil or <= 0 must be an error, not a panic). The nonce
-// is h.Nonce.Uint64(). new(big.Int).SetBytes(hash[:]) reads a hash as a number.
 func VerifySeal(h *types.Header) error {
-	return ErrNotImplemented
+	if h == nil || h.Difficulty == nil || h.Difficulty.Sign() <= 0 {
+		return fmt.Errorf("%w: header has difficulty %v", ErrInvalidDifficulty, difficultyString(h))
+	}
+	target := Target(h.Difficulty)
+	if target == nil {
+		return fmt.Errorf("%w: header has difficulty %v", ErrInvalidDifficulty, h.Difficulty)
+	}
+	pow := PowHash(SealHash(h), h.Nonce.Uint64())
+	if pow != h.MixDigest {
+		return fmt.Errorf("%w: mix digest %s, PoW hash is %s", ErrInvalidMixDigest, h.MixDigest.Hex(), pow.Hex())
+	}
+	if new(big.Int).SetBytes(pow[:]).Cmp(target) > 0 {
+		return fmt.Errorf("%w: PoW hash %s is above the target %s", ErrInvalidPoW, pow.Hex(), target.String())
+	}
+	return nil
+}
+
+func difficultyString(h *types.Header) any {
+	if h == nil || h.Difficulty == nil {
+		return nil
+	}
+	return h.Difficulty
 }
 
 // sealBatch is how many nonces Seal tries between calls to throttle.Wait.
@@ -86,16 +108,36 @@ const sealBatch = 1024
 // (b.WithSeal(header with Nonce and MixDigest set)). It tries nonces in batches of
 // sealBatch and calls throttle.Wait(ctx, sealBatch) after each batch, which both caps the
 // hashrate (a nil throttle means no cap) and returns an error once ctx is cancelled: then
-// Seal returns that error. Start from a random nonce so that two miners working on the
+// Seal returns that error. It starts from a random nonce so that two miners working on the
 // same header do not try the same nonces.
-//
-// TODO:
-//   - h := b.Header() is already a copy; check h.Difficulty like VerifySeal does;
-//   - compute SealHash(h) and the target once, outside the loop;
-//   - nonce := rand.Uint64(); then loop: try sealBatch nonces (nonce, nonce+1, ...); when
-//     PowHash(seal, nonce) <= target, set h.Nonce = types.EncodeNonce(nonce) and
-//     h.MixDigest = that hash, and return b.WithSeal(h), nil;
-//   - after each batch: if err := throttle.Wait(ctx, sealBatch); err != nil { return nil, err }.
 func Seal(ctx context.Context, b *types.Block, throttle *Throttle) (*types.Block, error) {
-	return nil, ErrNotImplemented
+	if b == nil {
+		return nil, fmt.Errorf("%w: nil block", ErrInvalidDifficulty)
+	}
+	h := b.Header()
+	if h.Difficulty == nil || h.Difficulty.Sign() <= 0 {
+		return nil, fmt.Errorf("%w: header has difficulty %v", ErrInvalidDifficulty, difficultyString(h))
+	}
+	target := Target(h.Difficulty)
+	if target == nil {
+		return nil, fmt.Errorf("%w: header has difficulty %v", ErrInvalidDifficulty, h.Difficulty)
+	}
+	seal := SealHash(h)
+	nonce := rand.Uint64()
+	var num big.Int
+	for {
+		for i := 0; i < sealBatch; i++ {
+			pow := PowHash(seal, nonce)
+			num.SetBytes(pow[:])
+			if num.Cmp(target) <= 0 {
+				h.Nonce = types.EncodeNonce(nonce)
+				h.MixDigest = pow
+				return b.WithSeal(h), nil
+			}
+			nonce++
+		}
+		if err := throttle.Wait(ctx, sealBatch); err != nil {
+			return nil, err
+		}
+	}
 }

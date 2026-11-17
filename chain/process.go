@@ -9,12 +9,6 @@ package chain
 // receives it, and rejects it unless it gets exactly the same values (process). That is
 // why every node can trust the state without trusting the miner.
 //
-// Running a block is: for each transaction in order, applyTx (the EVM, in executor.go);
-// then the block reward to the coinbase (payReward); then stateRoot. Mind the difference
-// between an invalid transaction (applyTx returns an error: wrong nonce, cannot pay,
-// does not fit the block's gas, ...), which can never be in a block, and a reverted one,
-// which is a normal transaction with a failed receipt (Status 0) that still pays its gas.
-//
 // Helpers (executor.go): openState, newGasPool, applyTx, payReward, stateRoot,
 // commitState, txsRoot, receiptsRoot, logsBloom, assemble.
 // Tests: go test ./chain -run TestExec -v
@@ -28,15 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 )
 
-// Packages you will probably need (delete these lines once you use them).
-var (
-	_ = fmt.Errorf
-	_ = common.Hash{}
-	_ = (*state.StateDB)(nil)
-)
-
-// execResult is a suggestion: what running a list of transactions produced. Change it
-// as you like; only build and process are called from outside this file.
+// execResult is what running a list of transactions produced.
 type execResult struct {
 	txs      []*types.Transaction // the transactions that were executed
 	receipts []*types.Receipt
@@ -44,45 +30,106 @@ type execResult struct {
 	gasUsed  uint64
 }
 
+// execute is the loop shared by build and process. It opens the parent's state, applies
+// txs in order, pays the block reward and returns the result with the new state.
+//
+// With strict set, an invalid transaction rejects the whole block (process); without it,
+// the transaction is skipped in place and the later ones are still tried (build).
+func (x *Executor) execute(parent *types.Header, h *types.Header, blockHash common.Hash,
+	txs []*types.Transaction, getHash vm.GetHashFunc, strict bool) (*execResult, *state.StateDB, error) {
+
+	st, err := x.openState(parent.Root)
+	if err != nil {
+		return nil, nil, err
+	}
+	gp := newGasPool(h)
+	res := &execResult{}
+	for _, tx := range txs {
+		// The index is the number of transactions actually included so far, not the
+		// position in the candidate list.
+		receipt, reason, err := x.applyTx(h, blockHash, getHash, st, gp, len(res.txs), tx)
+		if err != nil {
+			if strict {
+				return nil, nil, fmt.Errorf("%w: transaction %d %s is invalid: %v",
+					ErrInvalidBlock, len(res.txs), tx.Hash().TerminalString(), err)
+			}
+			continue // invalid here: leave it out, try the next one
+		}
+		res.txs = append(res.txs, tx)
+		res.receipts = append(res.receipts, receipt)
+		res.reverts = append(res.reverts, reason)
+	}
+	// The reward comes after all transactions: a coinbase cannot spend the reward of the
+	// block it is mining inside that block.
+	x.payReward(h, st)
+	res.gasUsed = gp.CumulativeUsed()
+	return res, st, nil
+}
+
 // build executes candidate transactions on top of parent and returns the unsealed block.
 // h has every field set except those that depend on execution: build fills in Root,
 // GasUsed, TxHash, ReceiptHash and Bloom (UncleHash is the empty hash). Invalid
-// transactions are left out, in place: the others are tried in the given order, so a
-// transaction that does not fit in the gas left does not stop a smaller one after it.
-// Nothing is written to the state database: the block is executed again, for real, by
-// process when it is inserted (so the receipts here have a zero block hash; that is fine).
-//
-// TODO:
-//  1. Open the parent's state (openState(parent.Root)) and make the block's gas pool
-//     (newGasPool(h)).
-//  2. applyTx each candidate in order. Pass the number of transactions included so far
-//     as the index, not the position in txs. On an error, leave the transaction out.
-//  3. payReward, after all transactions (a coinbase cannot spend the reward of the block
-//     it is mining).
-//  4. Fill in h.Root (stateRoot) and h.GasUsed (gp.CumulativeUsed()); assemble computes
-//     the rest. Work on a copy of h (types.CopyHeader): the caller owns it.
-//
-// build and process run the same loop; you may share it (in a function like execute,
-// with a "strict" flag), but get build working first: the tests of the later tasks use it.
+// transactions are left out, in place. Nothing is written to the state database: process
+// runs the block again when it is inserted (receipts here have a zero block hash).
 func (x *Executor) build(parent *types.Header, h *types.Header, txs []*types.Transaction, getHash vm.GetHashFunc) (*types.Block, error) {
-	return nil, ErrNotImplemented
+	if parent == nil || h == nil {
+		return nil, fmt.Errorf("%w: nil parent or header", ErrInvalidBlock)
+	}
+	h = types.CopyHeader(h)
+	res, st, err := x.execute(parent, h, common.Hash{}, txs, getHash, false)
+	if err != nil {
+		return nil, err
+	}
+	h.Root = x.stateRoot(h, st)
+	h.GasUsed = res.gasUsed
+	h.UncleHash = types.EmptyUncleHash
+	return assemble(h, res.txs, res.receipts), nil
 }
 
 // process executes block b on top of parent and checks every commitment in b's header.
-// Only if they all hold is the new state committed (commitState) and the result
-// returned. Every reason to reject the block is an error wrapping ErrInvalidBlock.
-//
-// TODO:
-//  1. The body must match the header: no uncles, no withdrawals (b.Uncles(),
-//     b.Withdrawals() must be empty and nil), and txsRoot(b.Transactions()) == TxHash.
-//  2. Run the transactions like build does, but strictly: one invalid transaction makes
-//     the whole block invalid (do not skip it: a block that skipped it would have the
-//     same header as one without it). Use b.Hash() as the block hash, so that receipts
-//     and logs point to their block.
-//  3. payReward; then compare GasUsed, Bloom (logsBloom), ReceiptHash (receiptsRoot) and
-//     Root (stateRoot) with the header.
-//  4. Only then commitState, and return &BlockResult{Receipts, Reverts}: one receipt
-//     and one revert reason ("" if it succeeded) per transaction, in block order.
+// Only if they all hold is the new state committed and the result returned. Every reason
+// to reject the block is an error wrapping ErrInvalidBlock.
 func (x *Executor) process(parent *types.Header, b *types.Block, getHash vm.GetHashFunc) (*BlockResult, error) {
-	return nil, ErrNotImplemented
+	if parent == nil || b == nil {
+		return nil, fmt.Errorf("%w: nil block or parent", ErrInvalidBlock)
+	}
+	// 1. The body must match the header: no uncles, no withdrawals.
+	if len(b.Uncles()) != 0 {
+		return nil, fmt.Errorf("%w: body has %d uncles", ErrInvalidBlock, len(b.Uncles()))
+	}
+	if b.Withdrawals() != nil {
+		return nil, fmt.Errorf("%w: body has withdrawals", ErrInvalidBlock)
+	}
+	txs := b.Transactions()
+	if got := txsRoot(txs); got != b.TxHash() {
+		return nil, fmt.Errorf("%w: transactions root is %s, header says %s",
+			ErrInvalidBlock, got.Hex(), b.TxHash().Hex())
+	}
+
+	// 2. Execute strictly: one invalid transaction makes the block invalid.
+	h := b.Header()
+	res, st, err := x.execute(parent, h, b.Hash(), txs, getHash, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Every commitment must match the execution result.
+	if res.gasUsed != h.GasUsed {
+		return nil, fmt.Errorf("%w: gas used is %d, header says %d", ErrInvalidBlock, res.gasUsed, h.GasUsed)
+	}
+	if bloom := logsBloom(res.receipts); bloom != h.Bloom {
+		return nil, fmt.Errorf("%w: logs bloom does not match the receipts", ErrInvalidBlock)
+	}
+	if root := receiptsRoot(res.receipts); root != h.ReceiptHash {
+		return nil, fmt.Errorf("%w: receipts root is %s, header says %s", ErrInvalidBlock, root.Hex(), h.ReceiptHash.Hex())
+	}
+	if root := x.stateRoot(h, st); root != h.Root {
+		return nil, fmt.Errorf("%w: state root is %s, header says %s", ErrInvalidBlock, root.Hex(), h.Root.Hex())
+	}
+
+	// 4. Only now keep the state; a rejected block leaves nothing behind.
+	if err := x.commitState(h, st); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidBlock, err)
+	}
+	return &BlockResult{Receipts: res.receipts, Reverts: res.reverts}, nil
 }

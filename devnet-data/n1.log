@@ -1,0 +1,6 @@
+[n1] 14:09:38.709125 TODO: Handler.SyncOnce is not implemented yet
+[n1] 14:09:38.709195 miner started
+[n1] 14:09:38.709204 node n1 listening on http://127.0.0.1:28001, genesis 09d66a..e4e81a, head 0, 2 peers, mining=true hashrate=200kH/s
+[n1] 14:09:38.709328 TODO: Miner.loop is not implemented yet
+[n1] 14:09:57.003906 shutting down
+[n1] 14:09:57.003934 miner stopped

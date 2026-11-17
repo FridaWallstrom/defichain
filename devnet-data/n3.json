@@ -1,0 +1,17 @@
+{
+  "id": "n3",
+  "listen": "127.0.0.1:28003",
+  "peers": {
+    "n1": "http://127.0.0.1:28001",
+    "n2": "http://127.0.0.1:28002"
+  },
+  "coinbase": "0xd068552BFE5f2D908dDdEe081c120535200F8CBF",
+  "mine": true,
+  "hashrate": 200000,
+  "net": {
+    "blocked": null,
+    "delay": "0s",
+    "jitter": "0s",
+    "drop": 0
+  }
+}
